@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -212,6 +213,66 @@ def wait_http(url: str, process: subprocess.Popen, timeout: float = 15.0) -> Non
     die(f"gateway health check timed out: {last_error}")
 
 
+def chown_tree(path: Path, uid: int, gid: int) -> None:
+    try:
+        os.chown(path, uid, gid, follow_symlinks=False)
+    except (FileNotFoundError, PermissionError):
+        return
+    if not path.is_dir():
+        return
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            item = Path(root) / name
+            try:
+                os.chown(item, uid, gid, follow_symlinks=False)
+            except (FileNotFoundError, PermissionError):
+                pass
+
+
+def choose_agent_identity(home_dir: Path, plugin_data: Path) -> tuple[int, int, str] | None:
+    if os.geteuid() != 0:
+        return None
+
+    template_stat = TEMPLATE_DIR.stat()
+    if template_stat.st_uid != 0:
+        uid, gid = template_stat.st_uid, template_stat.st_gid
+        try:
+            username = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            username = f"uid-{uid}"
+    else:
+        account = None
+        for candidate in ("pwuser", "node", "nobody"):
+            try:
+                found = pwd.getpwnam(candidate)
+            except KeyError:
+                continue
+            if found.pw_uid != 0:
+                account = found
+                break
+        if account is None:
+            die("ARC is running as root and no non-root execution user is available")
+        uid, gid, username = account.pw_uid, account.pw_gid, account.pw_name
+        chown_tree(TEMPLATE_DIR, uid, gid)
+
+    chown_tree(home_dir, uid, gid)
+    chown_tree(plugin_data, uid, gid)
+    return uid, gid, username
+
+
+def privilege_dropper(identity: tuple[int, int, str] | None):
+    if identity is None:
+        return None
+    uid, gid, _ = identity
+
+    def drop() -> None:
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
+
+    return drop
+
+
 def cleanup() -> None:
     for child in reversed(_children):
         if child.poll() is None:
@@ -253,6 +314,7 @@ def main() -> int:
     plugin_data = ARTIFACTS_DIR / "gsc-plugin-data"
     home_dir.mkdir(parents=True, exist_ok=True)
     plugin_data.mkdir(parents=True, exist_ok=True)
+    identity = choose_agent_identity(home_dir, plugin_data)
 
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
@@ -298,6 +360,12 @@ def main() -> int:
     claude_env = env.copy()
     claude_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
     claude_env["ANTHROPIC_API_KEY"] = "arc-local"
+    for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
+        claude_env.pop(key, None)
+    if identity is not None:
+        _, _, username = identity
+        claude_env["USER"] = username
+        claude_env["LOGNAME"] = username
 
     command = [
         str(claude_bin),
@@ -315,7 +383,12 @@ def main() -> int:
     ]
 
     print("[arc-claude-gsc] starting Claude Code", flush=True)
-    claude = subprocess.Popen(command, cwd=TEMPLATE_DIR, env=claude_env)
+    claude = subprocess.Popen(
+        command,
+        cwd=TEMPLATE_DIR,
+        env=claude_env,
+        preexec_fn=privilege_dropper(identity),
+    )
     _children.append(claude)
     return claude.wait()
 
