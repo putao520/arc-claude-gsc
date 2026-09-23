@@ -2,34 +2,34 @@
 
 ARC-Bench / Factory26 custom-agent adapter for **original Claude Code + GSC**.
 
-The repository is intentionally thin:
+This repository intentionally stays thin:
 
-- Claude Code remains upstream/original.
+- Claude Code is the original upstream binary, pinned by version and SHA-256.
 - GSC MCP and hooks remain JavaScript.
-- `gsc-spec-server` is distributed as a compiled Linux x86_64 Node SEA executable.
-- A pinned lightweight Anthropic-to-OpenAI compatibility proxy bridges Claude Code to ARC's OpenAI-compatible model endpoint.
-- The ARC adapter only owns bootstrap/lifecycle; it does not reimplement planning, coding, testing, or GSC orchestration.
+- `gsc-spec-server` is shipped as a compiled Linux x86_64 Node SEA executable.
+- TypeScript LSP is bundled as the Web profile.
+- A pinned small CLI proxy converts Claude's Anthropic Messages API to ARC's OpenAI-compatible Chat Completions endpoint.
+- `main.py` only owns bootstrap/lifecycle. It does not reimplement agent planning, coding, testing, or GSC orchestration.
 
 ## Runtime topology
 
 ```text
 ARC runner
   -> /workspace/submission/main.py
-  -> anthropic-proxy
-  -> ARC OpenAI-compatible API
-
-  -> Claude Code
-     cwd=/workspace/template
-     --plugin-dir runtime/gsc
-
-       -> GSC MCP (JavaScript)
-          -> compiled gsc-spec-server
-          -> TypeScript LSP profile
+     -> unpack pinned runtime into /workspace/artifacts/runtime
+     -> start anthropic-proxy
+        -> ARC OpenAI-compatible API
+     -> start original Claude Code
+        cwd=/workspace/template
+        --plugin-dir <unpacked GSC>
+        -> GSC MCP (JavaScript)
+           -> compiled gsc-spec-server
+           -> TypeScript LSP
 ```
 
-## ARC workspace contract
+When ARC starts the submission as root, `main.py` automatically drops only the Claude/GSC process tree to a non-root workspace user. This is required because Claude Code refuses bypass-permission mode as root.
 
-The adapter expects the standard ARC layout:
+## ARC workspace contract
 
 ```text
 /workspace/
@@ -42,9 +42,97 @@ The adapter expects the standard ARC layout:
   artifacts/
 ```
 
-It edits only `/workspace/template`.
+The agent modifies only `/workspace/template`. Runtime extraction and logs go under `/workspace/artifacts`.
 
-## Required ARC environment
+## Pinned components
+
+See `runtime.lock.json`.
+
+Current pinned stack:
+
+- Claude Code 2.1.281
+- GSC 6.8.1733
+- anthropic-proxy v1.1.0
+- TypeScript Language Server 5.1.3
+- TypeScript 5.9.3
+- bundled Node 22.23.2
+
+Every downloaded/runtime-critical executable is SHA-256 checked.
+
+## Build the ARC submission
+
+Build-machine requirements:
+
+- Linux x86_64
+- Python 3
+- Node.js >= 22 + npm
+- curl
+- tar
+
+Run:
+
+```bash
+git clone https://github.com/putao520/arc-claude-gsc.git
+cd arc-claude-gsc
+./scripts/package_submission.sh
+```
+
+Output:
+
+```text
+dist/
+  submission/
+  submission.zip
+```
+
+The build downloads only pinned Release assets, verifies hashes, installs the pinned original Claude Code package, keeps the single Linux executable, compresses it, and creates the final ZIP.
+
+## Run the ARC-like smoke test
+
+Docker is required.
+
+To build and test in one command:
+
+```bash
+./scripts/smoke_arc_like.sh
+```
+
+If `dist/submission.zip` already exists:
+
+```bash
+ARC_SKIP_PACKAGE=1 ./scripts/smoke_arc_like.sh
+```
+
+The smoke test uses `mcr.microsoft.com/playwright/python:v1.54.0-jammy`, creates the ARC `/workspace` layout, starts a local OpenAI-compatible mock upstream, then verifies the real chain:
+
+```text
+main.py
+  -> runtime extraction
+  -> anthropic-proxy
+  -> original Claude Code
+  -> real Write tool call
+  -> GSC plugin/MCP load
+  -> compiled GSC server
+  -> TypeScript LSP
+  -> /workspace/template/ARC_SMOKE.txt
+```
+
+A pass ends with:
+
+```text
+ARC-like smoke PASS
+result: ARC_CLAUDE_GSC_OK
+```
+
+## Upload to ARC-Bench
+
+1. Build `dist/submission.zip`.
+2. Run the ARC-like smoke test.
+3. In ARC-Bench, create/select a **Custom Agent** submission and upload `dist/submission.zip`.
+4. Run the platform's Smoke Competition first.
+5. Once the Smoke task is stable, run the Factory26/target competition tasks with the same submission version.
+
+ARC injects the model credentials/runtime variables. The adapter expects:
 
 - `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
@@ -52,24 +140,14 @@ It edits only `/workspace/template`.
 - `ARCBENCH_TEMPLATE_DIR` (defaults to `/workspace/template`)
 - `ARCBENCH_PROMPT_PATH` or `ARCBENCH_TASK_PROMPT`
 
-## Pinned components
+No model API key is stored in this repository or submission bundle.
 
-See `runtime.lock.json`.
+## Runtime Release
 
-The runtime is published as a GitHub Release asset and copied into the final ARC submission package. The submission does not download dependencies at contest runtime.
-
-## Local ARC-like smoke
-
-The project includes an ARC-like Docker smoke environment using the same workspace layout and a Jammy/Playwright-style base. It verifies:
-
-1. bundled Node 22;
-2. TypeScript LSP;
-3. JS MCP initialize;
-4. MCP tools/list;
-5. compiled GSC server autostart;
-6. GSC /health;
-7. a real MCP tool call.
+The GSC runtime is published under the `gsc-runtime-v1` Release. The submission embeds the compressed pinned asset, so contest runtime does **not** download GSC, Claude Code, Node, LSP, or the gateway from the internet.
 
 ## Security / IP boundary
 
-The compiled GSC server is shipped as an ELF executable. The heavy server implementation is not included as source in the public runtime package. MCP/hook integration stays JavaScript by design.
+The heavy GSC server implementation is not shipped as a source directory in the public plugin runtime; the server is delivered as a compiled Node SEA ELF. MCP/hook integration remains JavaScript by design.
+
+Node SEA is a deployment boundary, not a claim of irreversible source-code protection.
