@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,11 +17,14 @@ SUBMISSION_DIR = Path(os.environ.get("ARCBENCH_SUBMISSION_DIR", Path(__file__).r
 TEMPLATE_DIR = Path(os.environ.get("ARCBENCH_TEMPLATE_DIR", "/workspace/template"))
 TASK_DIR = Path(os.environ.get("ARCBENCH_TASK_DIR", "/workspace/task"))
 ARTIFACTS_DIR = Path(os.environ.get("ARCBENCH_ARTIFACTS_DIR", "/workspace/artifacts"))
+
+LOCK_PATH = SUBMISSION_DIR / "runtime.lock.json"
 RUNTIME_DIR = SUBMISSION_DIR / "runtime"
-GSC_DIR = RUNTIME_DIR / "gsc"
-CLAUDE_DIR = RUNTIME_DIR / "claude"
+PAYLOAD_DIR = RUNTIME_DIR / "payloads"
+ZSTD_BIN = RUNTIME_DIR / "bin" / "zstd"
+GSC_PAYLOAD = PAYLOAD_DIR / "gsc-runtime.tar.zst"
+CLAUDE_PAYLOAD = PAYLOAD_DIR / "claude.zst"
 GATEWAY_BIN = RUNTIME_DIR / "gateway" / "anthropic-proxy"
-CLAUDE_BIN = CLAUDE_DIR / "node_modules" / ".bin" / "claude"
 
 _children: list[subprocess.Popen] = []
 
@@ -29,8 +35,134 @@ def die(message: str, code: int = 2) -> None:
 
 
 def require_file(path: Path, label: str) -> None:
-    if not path.exists():
+    if not path.is_file():
         die(f"{label} not found: {path}")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_sha256(path: Path, expected: str, label: str) -> None:
+    actual = sha256_file(path)
+    if actual != expected:
+        die(f"{label} SHA-256 mismatch: expected {expected}, got {actual}")
+
+
+def load_lock() -> dict:
+    require_file(LOCK_PATH, "runtime lock")
+    try:
+        return json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        die(f"invalid runtime.lock.json: {exc}")
+
+
+def extract_gsc(lock: dict, cache_root: Path) -> Path:
+    expected = lock["gsc"]["sha256"]
+    target = cache_root / "gsc"
+    marker = target / ".arc-payload-sha256"
+    server = target / "bin" / "gsc-spec-server"
+    bootstrap = target / "mcp" / "src" / "bootstrap.mjs"
+
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected:
+        if server.is_file() and bootstrap.is_file():
+            return target
+
+    verify_sha256(GSC_PAYLOAD, expected, "GSC runtime payload")
+
+    temp = cache_root / f".gsc-{os.getpid()}.tmp"
+    shutil.rmtree(temp, ignore_errors=True)
+    temp.mkdir(parents=True)
+
+    zstd = subprocess.Popen(
+        [str(ZSTD_BIN), "-dc", str(GSC_PAYLOAD)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert zstd.stdout is not None
+    tar = subprocess.run(
+        ["tar", "-xf", "-", "-C", str(temp)],
+        stdin=zstd.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    zstd.stdout.close()
+    zstd_stderr = (zstd.stderr.read() if zstd.stderr else b"").decode("utf-8", "replace")
+    zstd_rc = zstd.wait()
+
+    if zstd_rc != 0 or tar.returncode != 0:
+        shutil.rmtree(temp, ignore_errors=True)
+        die(
+            "failed to extract GSC runtime: "
+            f"zstd={zstd_rc} {zstd_stderr[-500:]!r}; "
+            f"tar={tar.returncode} {tar.stderr[-500:]!r}"
+        )
+
+    unpacked = temp / "plugin-final"
+    if not unpacked.is_dir():
+        shutil.rmtree(temp, ignore_errors=True)
+        die("GSC runtime archive is missing plugin-final/")
+
+    (unpacked / ".arc-payload-sha256").write_text(expected + "\n", encoding="utf-8")
+    shutil.rmtree(target, ignore_errors=True)
+    unpacked.rename(target)
+    shutil.rmtree(temp, ignore_errors=True)
+    return target
+
+
+def extract_claude(lock: dict, cache_root: Path) -> Path:
+    expected = lock["claudeCode"]["binarySha256"]
+    target_dir = cache_root / "claude"
+    target = target_dir / "claude"
+    marker = target_dir / ".arc-binary-sha256"
+
+    if target.is_file() and marker.is_file():
+        if marker.read_text(encoding="utf-8").strip() == expected:
+            return target
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    temp = target_dir / f".claude-{os.getpid()}.tmp"
+    temp.unlink(missing_ok=True)
+
+    result = subprocess.run(
+        [str(ZSTD_BIN), "-d", "-f", str(CLAUDE_PAYLOAD), "-o", str(temp)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        temp.unlink(missing_ok=True)
+        die(f"failed to extract Claude Code: {result.stderr[-500:]}")
+
+    verify_sha256(temp, expected, "Claude Code binary")
+    temp.chmod(0o755)
+    temp.replace(target)
+    marker.write_text(expected + "\n", encoding="utf-8")
+    return target
+
+
+def prepare_runtime(lock: dict) -> tuple[Path, Path]:
+    require_file(ZSTD_BIN, "zstd")
+    require_file(GSC_PAYLOAD, "GSC runtime payload")
+    require_file(CLAUDE_PAYLOAD, "Claude Code payload")
+    require_file(GATEWAY_BIN, "anthropic-proxy")
+
+    verify_sha256(ZSTD_BIN, lock["zstd"]["sha256"], "zstd")
+    verify_sha256(GATEWAY_BIN, lock["gateway"]["binarySha256"], "anthropic-proxy")
+
+    ZSTD_BIN.chmod(0o755)
+    GATEWAY_BIN.chmod(0o755)
+
+    cache_root = ARTIFACTS_DIR / "runtime"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    gsc_dir = extract_gsc(lock, cache_root)
+    claude_bin = extract_claude(lock, cache_root)
+    return gsc_dir, claude_bin
 
 
 def task_prompt() -> str:
@@ -51,7 +183,7 @@ def task_prompt() -> str:
         die("no ARC task prompt or task requirements were found")
 
     parts.append(
-        "\nApply the requested changes directly inside /workspace/template. "
+        "Apply the requested changes directly inside /workspace/template. "
         "Use the loaded GSC plugin when useful. Finish only after validating the implementation."
     )
     return "\n\n".join(parts)
@@ -80,14 +212,15 @@ def wait_http(url: str, process: subprocess.Popen, timeout: float = 15.0) -> Non
     die(f"gateway health check timed out: {last_error}")
 
 
-def cleanup(*_: object) -> None:
+def cleanup() -> None:
     for child in reversed(_children):
         if child.poll() is None:
             try:
                 child.terminate()
             except ProcessLookupError:
                 pass
-    deadline = time.monotonic() + 3
+
+    deadline = time.monotonic() + 3.0
     for child in reversed(_children):
         if child.poll() is None:
             try:
@@ -100,11 +233,6 @@ def cleanup(*_: object) -> None:
 
 
 def main() -> int:
-    require_file(GATEWAY_BIN, "anthropic-proxy")
-    require_file(CLAUDE_BIN, "Claude Code")
-    require_file(GSC_DIR / "bin" / "gsc-spec-server", "compiled GSC server")
-    require_file(GSC_DIR / "mcp" / "src" / "bootstrap.mjs", "GSC MCP bootstrap")
-
     if not TEMPLATE_DIR.is_dir():
         die(f"ARC template directory not found: {TEMPLATE_DIR}")
 
@@ -115,6 +243,12 @@ def main() -> int:
         die("OPENAI_BASE_URL, OPENAI_API_KEY, and MODEL are required")
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    lock = load_lock()
+    gsc_dir, claude_bin = prepare_runtime(lock)
+
+    require_file(gsc_dir / "bin" / "gsc-spec-server", "compiled GSC server")
+    require_file(gsc_dir / "mcp" / "src" / "bootstrap.mjs", "GSC MCP bootstrap")
+
     home_dir = ARTIFACTS_DIR / "home"
     plugin_data = ARTIFACTS_DIR / "gsc-plugin-data"
     home_dir.mkdir(parents=True, exist_ok=True)
@@ -123,14 +257,13 @@ def main() -> int:
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
     env["GSC_ARC_PACKAGED_RUNTIME"] = "1"
-    env["GSC_RUNTIME_SERVER_BIN"] = str(GSC_DIR / "bin" / "gsc-spec-server")
+    env["GSC_RUNTIME_SERVER_BIN"] = str(gsc_dir / "bin" / "gsc-spec-server")
     env["CLAUDE_PLUGIN_DATA"] = str(plugin_data)
     env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     env["PATH"] = os.pathsep.join(
         [
-            str(GSC_DIR / "bin"),
-            str(GSC_DIR / "lsp" / "web" / "node_modules" / ".bin"),
-            str(CLAUDE_DIR / "node_modules" / ".bin"),
+            str(gsc_dir / "bin"),
+            str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"),
             env.get("PATH", ""),
         ]
     )
@@ -167,11 +300,11 @@ def main() -> int:
     claude_env["ANTHROPIC_API_KEY"] = "arc-local"
 
     command = [
-        str(CLAUDE_BIN),
+        str(claude_bin),
         "-p",
         task_prompt(),
         "--plugin-dir",
-        str(GSC_DIR),
+        str(gsc_dir),
         "--model",
         "sonnet",
         "--permission-mode",
@@ -187,9 +320,14 @@ def main() -> int:
     return claude.wait()
 
 
+def _signal_exit(code: int) -> None:
+    cleanup()
+    raise SystemExit(code)
+
+
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(143)))
-    signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(130)))
+    signal.signal(signal.SIGTERM, lambda *_: _signal_exit(143))
+    signal.signal(signal.SIGINT, lambda *_: _signal_exit(130))
     try:
         raise SystemExit(main())
     finally:
