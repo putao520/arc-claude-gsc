@@ -11,7 +11,8 @@
     "repository": "thomas-illiet/anthropic-proxy",
     "version": "v1.1.0",
     "asset": "anthropic-proxy_1.1.0_linux_amd64.tar.gz",
-    "sha256": "a040ffec3575f9b7da4cecd614be4637d090b3bcecc72f92b852586b3f280f1c"
+    "archiveSha256": "a040ffec3575f9b7da4cecd614be4637d090b3bcecc72f92b852586b3f280f1c",
+    "binarySha256": "5e8c16b8307e41e7c0869df2ed16162ed41d73cb5b1403cc681cb75b8d0f6e8c"
   },
   "gsc": {
     "version": "6.8.1733",
