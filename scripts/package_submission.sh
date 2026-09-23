@@ -13,7 +13,7 @@ require() {
   }
 }
 
-for cmd in python3 curl tar sha256sum npm; do
+for cmd in python3 curl tar sha256sum node npm; do
   require "$cmd"
 done
 
@@ -43,7 +43,7 @@ ZSTD_SHA="$(read_json zstd.sha256)"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/runtime/bin" "$STAGE/runtime/payloads" "$STAGE/runtime/gateway"
-cp "$ROOT/main.py" "$ROOT/runtime.lock.json" "$STAGE/"
+cp "$ROOT/main.py" "$ROOT/runtime.lock.json" "$ROOT/requirements.txt" "$STAGE/"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
