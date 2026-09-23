@@ -13,7 +13,7 @@ require() {
   }
 }
 
-for cmd in python3 curl tar zstd sha256sum npm zip; do
+for cmd in python3 curl tar zstd sha256sum npm; do
   require "$cmd"
 done
 
@@ -83,10 +83,17 @@ echo "[4/4] package ARC submission"
 )
 
 rm -f "$DIST/submission.zip"
-(
-  cd "$STAGE"
-  zip -qr "$DIST/submission.zip" .
-)
+python3 - "$STAGE" "$DIST/submission.zip" <<'PY'
+from pathlib import Path
+import sys, zipfile
+
+root = Path(sys.argv[1])
+out = Path(sys.argv[2])
+with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            zf.write(path, path.relative_to(root))
+PY
 
 echo
 echo "submission directory: $STAGE"
