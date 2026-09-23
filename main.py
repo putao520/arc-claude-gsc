@@ -380,6 +380,7 @@ def main() -> int:
         "--no-session-persistence",
         "--output-format",
         "stream-json",
+        "--verbose",
     ]
 
     print("[arc-claude-gsc] starting Claude Code", flush=True)
