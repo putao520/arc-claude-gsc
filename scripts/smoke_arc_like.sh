@@ -34,7 +34,7 @@ set +e
 python3 /workspace/tests/mock_openai.py >/workspace/artifacts/mock.log 2>&1 & mockpid=$!
 sleep 1
 python3 -m pip install -q -r /workspace/submission/requirements.txt
-cd /workspace/output
+cd /workspace/template
 env OPENAI_BASE_URL=http://127.0.0.1:19091/v1 OPENAI_API_KEY=mock-key MODEL=mock-model \
   ARCBENCH_SUBMISSION_DIR=/workspace/submission ARCBENCH_ARTIFACTS_DIR=/workspace/artifacts ARC_SKIP_FINAL_VALIDATION=1 \
   python3 /workspace/submission/main.py /workspace/requirements --output-dir /workspace/template --type web \
