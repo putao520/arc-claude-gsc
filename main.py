@@ -348,8 +348,13 @@ def main() -> int:
     identity = choose_agent_identity(output_dir, home_dir, plugin_data)
 
     env = os.environ.copy()
+    arc_runtime_src = SUBMISSION_DIR / "arcbench-agent-runtime" / "src"
+    if not arc_runtime_src.is_dir():
+        die(f"ARC-Bench agent runtime source not found: {arc_runtime_src}")
+    existing_pythonpath = env.get("PYTHONPATH", "")
     env.update({
         "HOME": str(home_dir),
+        "PYTHONPATH": os.pathsep.join(part for part in (str(arc_runtime_src), existing_pythonpath) if part),
         "GSC_ARC_PACKAGED_RUNTIME": "1",
         "GSC_RUNTIME_SERVER_BIN": str(gsc_dir / "bin" / "gsc-spec-server"),
         "CLAUDE_PLUGIN_DATA": str(plugin_data),
