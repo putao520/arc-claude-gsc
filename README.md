@@ -151,3 +151,9 @@ The GSC runtime is published under the `gsc-runtime-v1` Release. The submission 
 The heavy GSC server implementation is not shipped as a source directory in the public plugin runtime; the server is delivered as a compiled Node SEA ELF. MCP/hook integration remains JavaScript by design.
 
 Node SEA is a deployment boundary, not a claim of irreversible source-code protection.
+
+## License
+
+The original code in this repository is licensed under the [MIT License](./LICENSE).
+
+Third-party components, downloaded runtime assets, and bundled upstream binaries (including Claude Code, Node.js, TypeScript tooling, and other pinned components) are **not relicensed by this repository**. They retain their respective upstream licenses and terms. The MIT license applies only to code and materials for which `putao520` has the right to grant that license.
