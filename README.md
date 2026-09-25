@@ -59,88 +59,66 @@ Current pinned stack:
 
 Every downloaded/runtime-critical executable is SHA-256 checked.
 
-## Build the ARC submission
+## Factory26 current competition contract
 
-Build-machine requirements:
-
-- Linux x86_64
-- Python 3
-- Node.js >= 22 + npm
-- curl
-- tar
-
-Run:
+The current Agentic Software Factory runner invokes Python submissions as:
 
 ```bash
-git clone https://github.com/putao520/arc-claude-gsc.git
-cd arc-claude-gsc
-./scripts/package_submission.sh
+python3 main.py /path/to/requirements --output-dir /path/to/output --type web
+```
+
+`requirements.yaml` must have an `id: ROOT` tree. The adapter copies the official ARC-Bench starter project into the output directory, imports the official ARC skills when present, stores requirement traceability through `arcbench-runtime`, initializes git checkpoints, and then processes each direct ROOT child with original Claude Code + GSC in the same persistent worktree. Each subtree is also materialized under `SPEC/arcbench/` before Claude Code starts so GSC's SPEC-first gate is satisfied.
+
+## Build the ARC submission
+
+Download the current **Claude Code** starter ZIP from the competition page first. Keep that downloaded ZIP outside git and pass its path when packaging:
+
+```bash
+ARC_FACTORY26_STARTER_ZIP=/path/to/agent-claude-code-based.zip \
+  ./scripts/package_submission.sh
 ```
 
 Output:
 
 ```text
-dist/
-  submission/
-  submission.zip
+dist/submission.zip
 ```
 
-The build downloads only pinned Release assets, verifies hashes, installs the pinned original Claude Code package, keeps the single Linux executable, compresses it, and creates the final ZIP.
+The packager imports only the starter's `template/` and `skills/` directories. The original Claude Code, GSC runtime, zstd helper and protocol bridge remain version-pinned and SHA-256 verified. The competition ZIP itself is not committed to this repository.
 
-## Run the ARC-like smoke test
+## Run the Factory26-style smoke test
 
-Docker is required.
-
-To build and test in one command:
+Docker is required. The smoke creates a minimal starter fixture, packages the agent, and executes the exact current CLI shape with `requirements.yaml`:
 
 ```bash
 ./scripts/smoke_arc_like.sh
 ```
 
-If `dist/submission.zip` already exists:
+A pass verifies all of these at once:
+
+- original Claude Code starts through the OpenAI-compatible ARC model bridge;
+- GSC plugin/MCP loads;
+- a real write happens inside `--output-dir`;
+- `.arc/runner-events.jsonl` is produced;
+- ARC traceability files contain the requirement;
+- GSC's `SPEC/` gate is satisfied;
+- git contains an initial checkpoint and a per-module checkpoint.
+
+For a repeat run using an already-built `dist/submission.zip`:
 
 ```bash
 ARC_SKIP_PACKAGE=1 ./scripts/smoke_arc_like.sh
 ```
 
-The smoke test uses `mcr.microsoft.com/playwright/python:v1.54.0-jammy`, creates the ARC `/workspace` layout, starts a local OpenAI-compatible mock upstream, then verifies the real chain:
-
-```text
-main.py
-  -> runtime extraction
-  -> anthropic-proxy
-  -> original Claude Code
-  -> real Write tool call
-  -> GSC plugin/MCP load
-  -> compiled GSC server
-  -> TypeScript LSP
-  -> /workspace/template/ARC_SMOKE.txt
-```
-
-A pass ends with:
-
-```text
-ARC-like smoke PASS
-result: ARC_CLAUDE_GSC_OK
-```
-
 ## Upload to ARC-Bench
 
-1. Build `dist/submission.zip`.
-2. Run the ARC-like smoke test.
-3. In ARC-Bench, create/select a **Custom Agent** submission and upload `dist/submission.zip`.
-4. Run the platform's Smoke Competition first.
-5. Once the Smoke task is stable, run the Factory26/target competition tasks with the same submission version.
+1. Build `dist/submission.zip` using the current official Claude Code starter ZIP.
+2. Run the Factory26-style smoke test.
+3. Upload `dist/submission.zip` as a **Python** agent submission.
+4. Validate on the Smoke Competition before spending the official hackathon budget.
+5. Use the same tested submission version for the two Agentic Software Factory task packs.
 
-ARC injects the model credentials/runtime variables. The adapter expects:
-
-- `OPENAI_BASE_URL`
-- `OPENAI_API_KEY`
-- `MODEL`
-- `ARCBENCH_TEMPLATE_DIR` (defaults to `/workspace/template`)
-- `ARCBENCH_PROMPT_PATH` or `ARCBENCH_TASK_PROMPT`
-
-No model API key is stored in this repository or submission bundle.
+ARC injects `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `MODEL`; no model API key is embedded in the repository or submission archive.
 
 ## Runtime Release
 

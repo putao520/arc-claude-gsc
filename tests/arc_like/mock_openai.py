@@ -52,14 +52,14 @@ class Handler(BaseHTTPRequestHandler):
         arguments = None
         if tool_name:
             arguments = {
-                "file_path": "/workspace/template/ARC_SMOKE.txt",
+                "file_path": "/workspace/output/ARC_SMOKE.txt",
                 "content": "ARC_CLAUDE_GSC_OK\n",
             }
         else:
             tool_name = next((name for name in names if name == "Bash"), None)
             if tool_name:
                 arguments = {
-                    "command": "printf 'ARC_CLAUDE_GSC_OK\\n' > /workspace/template/ARC_SMOKE.txt"
+                    "command": "printf 'ARC_CLAUDE_GSC_OK\\n' > /workspace/output/ARC_SMOKE.txt"
                 }
 
         if not tool_name:
