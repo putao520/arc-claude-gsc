@@ -157,3 +157,35 @@ Node SEA is a deployment boundary, not a claim of irreversible source-code prote
 The original code in this repository is licensed under the [MIT License](./LICENSE).
 
 Third-party components, downloaded runtime assets, and bundled upstream binaries (including Claude Code, Node.js, TypeScript tooling, and other pinned components) are **not relicensed by this repository**. They retain their respective upstream licenses and terms. The MIT license applies only to code and materials for which `putao520` has the right to grant that license.
+
+## Factory26 competition adapter
+
+The current Agentic Software Factory runner invokes Python agents as:
+
+```bash
+python3 main.py /path/to/requirements --output-dir /path/to/output --type web
+```
+
+`requirements.yaml` must have `id: ROOT`. The adapter copies the official Factory starter project into the output directory, installs the official ARC-Bench skills under `.claude/skills`, then runs the pinned original Claude Code + GSC once per direct ROOT child subtree. A final integration-validation turn runs after all modules unless `ARC_SKIP_FINAL_VALIDATION=1`.
+
+The official ARC-Bench Claude Code starter ZIP is intentionally **not** committed to this public repository. Download it from the competition page and either place it at:
+
+```text
+vendor/agent-claude-code-based.zip
+```
+
+or point the build at it:
+
+```bash
+ARC_FACTORY_TEMPLATE_ZIP=/path/to/agent-claude-code-based.zip ./scripts/package_submission.sh
+```
+
+Packaging validates the official starter before copying only `template/`, `skills/`, and `arcbench-agent-runtime/` into the final submission. The resulting `dist/submission.zip` is the file to upload as a Python agent.
+
+Run the Factory-contract smoke test with:
+
+```bash
+ARC_FACTORY_TEMPLATE_ZIP=/path/to/agent-claude-code-based.zip ./scripts/smoke_arc_like.sh
+```
+
+The smoke test exercises the real packaged Claude Code → GSC → ARC model bridge against a synthetic `requirements.yaml` and verifies that the agent modifies the shared output directory.
