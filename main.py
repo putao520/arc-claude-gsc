@@ -257,6 +257,22 @@ def privilege_dropper(identity: tuple[int, int, str] | None):
     return drop
 
 
+def materialize_module_spec(output_dir: Path, module: RequirementModule) -> Path:
+    spec_dir = output_dir / "SPEC" / "ARC-BENCH"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in module.node_id)
+    path = spec_dir / f"{safe_id}.md"
+    body = (
+        f"# ARC-Bench requirement {module.node_id}: {module.name}\n\n"
+        "This file is materialized by the Factory adapter from the authoritative ROOT-child subtree for the current turn. "
+        "Keep implementation decisions aligned with it.\n\nRequirement subtree JSON:\n\n"
+        + json.dumps(module.subtree, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
 def module_prompt(module: RequirementModule, requirements_dir: Path, task_type: str, completed_ids: list[str], skills_dir: Path) -> str:
     completed = ", ".join(completed_ids) if completed_ids else "none"
     return textwrap.dedent(f"""
@@ -270,6 +286,9 @@ def module_prompt(module: RequirementModule, requirements_dir: Path, task_type: 
         Previously completed ROOT modules: {completed}
 
         ARC-Bench skills are installed in {skills_dir}.
+        The adapter has already materialized this requirement subtree into the local SPEC/ARC-BENCH tree
+        so GSC's SPEC-first workflow has an auditable source of truth. Update that module spec if your
+        implementation decisions materially refine it.
         Use arcbench-runtime-signals for useful progress updates, arcbench-traceability to record
         requirement/interface/test links, and arcbench-checkpoint for coherent git checkpoints.
         Run the provided skill scripts instead of hand-writing ARC metadata.
@@ -390,6 +409,9 @@ def main() -> int:
     completed: list[str] = []
     for module in modules:
         print(f"[arc-claude-gsc] module {module.index}/{module.total}: {module.node_id}", flush=True)
+        spec_path = materialize_module_spec(output_dir, module)
+        if identity is not None:
+            chown_tree(spec_path.parent, identity[0], identity[1])
         run_claude_turn(claude_bin, gsc_dir, output_dir, claude_env, identity, module_prompt(module, requirements_dir, args.task_type, completed, skills_dir))
         completed.append(module.node_id)
     if os.environ.get("ARC_SKIP_FINAL_VALIDATION", "0") != "1":

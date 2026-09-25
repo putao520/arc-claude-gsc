@@ -7,7 +7,7 @@ WORK="$DIST/arc-smoke-workspace"
 
 if [[ "${ARC_SKIP_PACKAGE:-0}" != "1" ]]; then "$ROOT/scripts/package_submission.sh"; fi
 test -f "$DIST/submission.zip"
-rm -rf "$WORK"; mkdir -p "$WORK"/{submission,requirements,output,tests,artifacts}
+rm -rf "$WORK"; mkdir -p "$WORK"/{submission,requirements,template,tests,artifacts}
 python3 - "$DIST/submission.zip" "$WORK/submission" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as zf: zf.extractall(sys.argv[2])
@@ -34,16 +34,16 @@ python3 -m pip install -q -r /workspace/submission/requirements.txt
 cd /workspace/output
 env OPENAI_BASE_URL=http://127.0.0.1:19091/v1 OPENAI_API_KEY=mock-key MODEL=mock-model \
   ARCBENCH_SUBMISSION_DIR=/workspace/submission ARCBENCH_ARTIFACTS_DIR=/workspace/artifacts ARC_SKIP_FINAL_VALIDATION=1 \
-  python3 /workspace/submission/main.py /workspace/requirements --output-dir /workspace/output --type web \
+  python3 /workspace/submission/main.py /workspace/requirements --output-dir /workspace/template --type web \
   >/workspace/artifacts/main.out 2>/workspace/artifacts/main.err
 rc=$?; kill "$mockpid" 2>/dev/null || true; exit "$rc"
 '
 rc=$?; set -e
-if [[ "$rc" -ne 0 ]] || ! grep -Fxq ARC_CLAUDE_GSC_OK "$WORK/output/ARC_SMOKE.txt" 2>/dev/null; then
+if [[ "$rc" -ne 0 ]] || ! grep -Fxq ARC_CLAUDE_GSC_OK "$WORK/template/ARC_SMOKE.txt" 2>/dev/null; then
   echo "Factory ARC-like smoke FAILED (main rc=$rc)" >&2
   for f in main.err gateway.log mock.log; do echo "--- $f ---" >&2; tail -120 "$WORK/artifacts/$f" >&2 || true; done
   exit 1
 fi
 echo "Factory ARC-like smoke PASS"
 echo "workspace: $WORK"
-echo "result:    $(cat "$WORK/output/ARC_SMOKE.txt")"
+echo "result:    $(cat "$WORK/template/ARC_SMOKE.txt")"
