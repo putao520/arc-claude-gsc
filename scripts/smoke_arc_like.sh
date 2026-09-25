@@ -7,7 +7,10 @@ WORK="$DIST/arc-smoke-workspace"
 
 if [[ "${ARC_SKIP_PACKAGE:-0}" != "1" ]]; then "$ROOT/scripts/package_submission.sh"; fi
 test -f "$DIST/submission.zip"
-rm -rf "$WORK"; mkdir -p "$WORK"/{submission,requirements,template,tests,artifacts}
+if [[ -e "$WORK" ]]; then
+  docker run --rm -v "$DIST:/dist" "$IMAGE" bash -lc 'rm -rf /dist/arc-smoke-workspace'
+fi
+mkdir -p "$WORK"/{submission,requirements,template,tests,artifacts}
 python3 - "$DIST/submission.zip" "$WORK/submission" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as zf: zf.extractall(sys.argv[2])
