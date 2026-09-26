@@ -149,20 +149,34 @@ if [[ "$rc" -ne 0 ]] || ! grep -Fxq ARC_CLAUDE_GSC_OK "$WORK/output/ARC_SMOKE.tx
   exit 1
 fi
 
-test -f "$WORK/output/.arc/runner-events.jsonl"
-test -f "$WORK/output/.arc/traceability/requirements.json"
-test -f "$WORK/output/SPEC/arcbench/REQ-SMOKE-A.md"
-test -f "$WORK/output/SPEC/arcbench/REQ-SMOKE-B.md"
-grep -q 'REQ-SMOKE-A' "$WORK/output/.arc/traceability/requirements.json"
-grep -q 'REQ-SMOKE-B' "$WORK/output/.arc/traceability/requirements.json"
-grep -q '"state": "completed"' "$WORK/output/.arc/runner-events.jsonl"
-grep -q 'claude-agent-sdk 0.2.159 bundled Claude Code' "$WORK/artifacts/main.out"
-grep -q 'downloading GSC runtime' "$WORK/artifacts/main.out"
-grep -q '"event": "module_retry"' "$WORK/artifacts/main.out"
-grep -q 'connection reset' "$WORK/artifacts/mock.log"
-grep -q 'recovery prompt observed' "$WORK/artifacts/mock.log"
-grep -q '"state": "paused"' "$WORK/output/.arc/runner-events.jsonl"
-grep -q '"state": "resumed"' "$WORK/output/.arc/runner-events.jsonl"
+require_file() {
+  [[ -f "$1" ]] || { echo "smoke assertion failed: missing file $1" >&2; exit 1; }
+}
+require_grep() {
+  local pattern="$1" file="$2" label="$3"
+  grep -q -- "$pattern" "$file" || {
+    echo "smoke assertion failed: $label" >&2
+    echo "--- tail $file ---" >&2
+    tail -120 "$file" >&2 2>/dev/null || true
+    exit 1
+  }
+}
+
+require_file "$WORK/output/.arc/runner-events.jsonl"
+require_file "$WORK/output/.arc/traceability/requirements.json"
+require_file "$WORK/output/SPEC/arcbench/REQ-SMOKE-A.md"
+require_file "$WORK/output/SPEC/arcbench/REQ-SMOKE-B.md"
+require_grep 'REQ-SMOKE-A' "$WORK/output/.arc/traceability/requirements.json" "REQ-SMOKE-A traceability missing"
+require_grep 'REQ-SMOKE-B' "$WORK/output/.arc/traceability/requirements.json" "REQ-SMOKE-B traceability missing"
+require_grep '"state": "completed"' "$WORK/output/.arc/runner-events.jsonl" "runner did not complete"
+require_grep 'claude-agent-sdk 0.2.159 bundled Claude Code' "$WORK/artifacts/main.out" "expected bundled Claude Code not used"
+require_grep '"event": "runtime_download"' "$WORK/artifacts/main.out" "runtime download event missing"
+require_grep '"label": "GSC runtime"' "$WORK/artifacts/main.out" "GSC runtime download event missing"
+require_grep '"event": "module_retry"' "$WORK/artifacts/main.out" "module retry was not observed"
+require_grep 'connection reset' "$WORK/artifacts/mock.log" "fault injection did not occur"
+require_grep 'recovery prompt observed' "$WORK/artifacts/mock.log" "recovery attempt did not reach mock"
+require_grep '"state": "paused"' "$WORK/output/.arc/runner-events.jsonl" "runner pause event missing"
+require_grep '"state": "resumed"' "$WORK/output/.arc/runner-events.jsonl" "runner resume event missing"
 
 commit_count="$(git -c safe.directory="$WORK/output" -C "$WORK/output" rev-list --count HEAD)"
 [[ "$commit_count" -ge 3 ]] || {
