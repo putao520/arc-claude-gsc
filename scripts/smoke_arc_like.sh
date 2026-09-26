@@ -3,6 +3,8 @@ set -euo pipefail
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 DIST="${ARC_DIST_DIR:-$ROOT/dist}"
 IMAGE="${ARC_SMOKE_IMAGE:-mcr.microsoft.com/playwright/python:v1.54.0-jammy}"
+CPUS="${ARC_SMOKE_CPUS:-4}"
+MEMORY="${ARC_SMOKE_MEMORY:-8g}"
 WORK="$DIST/arc-smoke-workspace"
 FIXTURE="$DIST/factory26-smoke-starter.zip"
 
@@ -42,7 +44,7 @@ children:
 YAML
 
 set +e
-docker run --rm --cpus=6 --memory=12g -v "$WORK:/workspace" -w /workspace/output "$IMAGE" bash -lc '
+docker run --rm --cpus="$CPUS" --memory="$MEMORY" -v "$WORK:/workspace" -w /workspace/output "$IMAGE" bash -lc '
 set -e
 python3 -m pip install -q -r /workspace/submission/requirements.txt
 python3 /workspace/tests/verify_arcbench_runtime.py
