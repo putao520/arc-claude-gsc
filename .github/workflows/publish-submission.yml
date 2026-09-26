@@ -1,0 +1,57 @@
+name: Publish ARC submission
+
+on:
+  push:
+    tags:
+      - submission-v1
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+
+      - name: Download current ARC-Bench Claude Code starter
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3             'https://www.arc-bench.com/api/competitions/smoke/starter-agent?language=python&template=claude_code'             -o /tmp/agent-claude-code-based.zip
+          echo '90bfe05b3b50b78418be7d672d7126b8bf173dfc8835c5237a2c51901aa9a290  /tmp/agent-claude-code-based.zip' | sha256sum -c -
+
+      - name: Build submission
+        shell: bash
+        env:
+          ARC_FACTORY26_STARTER_ZIP: /tmp/agent-claude-code-based.zip
+        run: |
+          set -euo pipefail
+          ./scripts/package_submission.sh
+          (
+            cd dist
+            sha256sum submission.zip > submission.SHA256SUMS
+          )
+
+      - name: Validate packaged submission
+        shell: bash
+        env:
+          ARC_SKIP_PACKAGE: "1"
+        run: |
+          set -euo pipefail
+          ./scripts/smoke_arc_like.sh
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload submission-v1             dist/submission.zip             dist/submission.SHA256SUMS             --clobber
+
+      - name: Show published digest
+        shell: bash
+        run: |
+          cat dist/submission.SHA256SUMS
