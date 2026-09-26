@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import importlib.metadata
 import json
@@ -12,8 +13,10 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import urllib.request
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +40,256 @@ class RequirementModule:
     node_id: str
     name: str
     subtree: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ClaudeRunResult:
+    returncode: int
+    is_error: bool
+    terminal_reason: str
+    subtype: str
+    api_error_status: int | None
+    tail: str
+
+
+@dataclass(frozen=True)
+class FailureClassification:
+    retryable: bool
+    reason: str
+
+
+RETRYABLE_MARKERS = (
+    "connection reset",
+    "econnreset",
+    "connection refused",
+    "temporarily unavailable",
+    "service unavailable",
+    "gateway timeout",
+    "timed out",
+    "timeout",
+    "upstream",
+    "overloaded",
+    "rate limit",
+    "too many requests",
+    "http 429",
+    "status 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 529",
+    "status 500",
+    "status 502",
+    "status 503",
+    "status 504",
+    "status 529",
+)
+
+NON_RETRYABLE_MARKERS = (
+    "invalid api key",
+    "invalid_api_key",
+    "authentication_error",
+    "unauthorized",
+    "forbidden",
+    "budget_exhausted",
+    "budget exhausted",
+    "insufficient_quota",
+    "invalid_request_error",
+    "model not found",
+    "model_not_found",
+    "unknown model",
+    "invalid model",
+    "context length exceeded",
+)
+
+
+def env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        die(f"{name} must be an integer, got {raw!r}")
+    if value < minimum or value > maximum:
+        die(f"{name} must be between {minimum} and {maximum}, got {value}")
+    return value
+
+
+
+def configured_base_urls(primary: str) -> list[str]:
+    urls = [primary.strip()]
+    raw = os.environ.get("ARC_FALLBACK_BASE_URLS", "").strip()
+    if raw:
+        for candidate in raw.replace(";", ",").split(","):
+            value = candidate.strip()
+            if not value or value in urls:
+                continue
+            parsed = urlparse(value)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                die(f"invalid ARC_FALLBACK_BASE_URLS entry: {value!r}")
+            urls.append(value)
+    return urls
+
+
+def base_url_for_attempt(base_urls: list[str], attempt: int) -> str:
+    if not base_urls:
+        raise ValueError("base_urls must not be empty")
+    return base_urls[min(max(attempt, 1) - 1, len(base_urls) - 1)]
+
+def upstream_host(base_url: str) -> str:
+    try:
+        parsed = urlparse(base_url)
+        return parsed.hostname or parsed.netloc or "<unknown>"
+    except Exception:
+        return "<unknown>"
+
+
+def parse_terminal_result(lines: list[str]) -> tuple[bool, str, str, int | None]:
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except Exception:
+            continue
+        if payload.get("type") != "result":
+            continue
+        raw_status = payload.get("api_error_status")
+        try:
+            api_error_status = int(raw_status) if raw_status is not None else None
+        except (TypeError, ValueError):
+            api_error_status = None
+        return (
+            bool(payload.get("is_error")),
+            str(payload.get("terminal_reason") or ""),
+            str(payload.get("subtype") or ""),
+            api_error_status,
+        )
+    return False, "", "", None
+
+
+def classify_claude_failure(result: ClaudeRunResult) -> FailureClassification:
+    if result.returncode == 0 and not result.is_error:
+        return FailureClassification(False, "success")
+
+    text = "\n".join(
+        part for part in (result.terminal_reason, result.subtype, result.tail) if part
+    ).lower()
+
+    for marker in NON_RETRYABLE_MARKERS:
+        if marker in text:
+            return FailureClassification(False, f"non-retryable:{marker}")
+
+    if result.api_error_status in (401, 403, 404):
+        return FailureClassification(False, f"non-retryable:http_{result.api_error_status}")
+    if result.api_error_status in (408, 429, 500, 502, 503, 504, 529):
+        return FailureClassification(True, f"retryable:http_{result.api_error_status}")
+
+    for marker in RETRYABLE_MARKERS:
+        if marker in text:
+            return FailureClassification(True, f"retryable:{marker}")
+
+    if result.terminal_reason.lower() == "api_error" and result.api_error_status is None:
+        return FailureClassification(True, "retryable:api_error")
+    return FailureClassification(False, "non-retryable:process_failure")
+
+
+def retry_delay_seconds(retry_index: int, base_seconds: int, max_seconds: int) -> int:
+    if retry_index <= 0:
+        return 0
+    return min(max_seconds, base_seconds * (2 ** (retry_index - 1)))
+
+
+def execute_with_retry(
+    run_attempt,
+    *,
+    max_retries: int,
+    base_seconds: int,
+    max_seconds: int,
+    on_retry=None,
+    sleep_fn=time.sleep,
+) -> tuple[ClaudeRunResult, int]:
+    total_attempts = max_retries + 1
+    last_result: ClaudeRunResult | None = None
+    for attempt in range(1, total_attempts + 1):
+        result = run_attempt(attempt)
+        last_result = result
+        classification = classify_claude_failure(result)
+        if not (result.returncode != 0 or result.is_error):
+            return result, attempt
+        if not classification.retryable or attempt >= total_attempts:
+            return result, attempt
+        delay = retry_delay_seconds(attempt, base_seconds, max_seconds)
+        if on_retry is not None:
+            on_retry(attempt, result, classification, delay)
+        sleep_fn(delay)
+    assert last_result is not None
+    return last_result, total_attempts
+
+
+def run_claude_streaming(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    preexec_fn,
+) -> ClaudeRunResult:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        preexec_fn=preexec_fn,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    _children.append(process)
+    stdout_tail: deque[str] = deque(maxlen=300)
+    stderr_tail: deque[str] = deque(maxlen=300)
+
+    def pump(stream, sink, tail: deque[str]) -> None:
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                tail.append(line.rstrip("\n"))
+                sink.write(line)
+                sink.flush()
+        finally:
+            stream.close()
+
+    threads = [
+        threading.Thread(target=pump, args=(process.stdout, sys.stdout, stdout_tail), daemon=True),
+        threading.Thread(target=pump, args=(process.stderr, sys.stderr, stderr_tail), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    returncode = process.wait()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    stdout_lines = list(stdout_tail)
+    is_error, terminal_reason, subtype, api_error_status = parse_terminal_result(stdout_lines)
+    combined_tail = "\n".join((stdout_lines + list(stderr_tail))[-300:])
+    return ClaudeRunResult(
+        returncode=returncode,
+        is_error=is_error,
+        terminal_reason=terminal_reason,
+        subtype=subtype,
+        api_error_status=api_error_status,
+        tail=combined_tail,
+    )
+
+
+def module_already_passed(runtime: AgentRuntime, node_id: str) -> bool:
+    try:
+        state = runtime.traceability.get_node_state(node_id)
+    except Exception:
+        return False
+    return bool(state and str(state.get("state") or "").upper() == "PASSED")
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,26 +337,80 @@ def download_verified(url: str, destination: Path, expected: str, label: str) ->
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_file() and sha256_file(destination) == expected:
         return destination
-    temp = destination.with_name(destination.name + f".{os.getpid()}.part")
-    temp.unlink(missing_ok=True)
-    print(f"[arc-claude-gsc] downloading {label}: {url}", flush=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "arc-claude-gsc/Factory26"})
-    last_error: Exception | None = None
-    for attempt in range(1, 4):
-        temp.unlink(missing_ok=True)
+
+    max_attempts = env_int("ARC_RUNTIME_DOWNLOAD_ATTEMPTS", 4, minimum=1, maximum=10)
+    temp = destination.with_name(destination.name + ".part")
+    for attempt in range(1, max_attempts + 1):
+        offset = temp.stat().st_size if temp.is_file() else 0
+        headers = {"User-Agent": "arc-claude-gsc/Factory26"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        print(
+            json.dumps(
+                {
+                    "event": "runtime_download",
+                    "label": label,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "resume_bytes": offset,
+                    "upstream_host": upstream_host(url),
+                }
+            ),
+            flush=True,
+        )
+        request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=600) as response, temp.open("wb") as stream:
-                shutil.copyfileobj(response, stream, length=1024 * 1024)
-            verify_sha256(temp, expected, label)
+            with urllib.request.urlopen(request, timeout=600) as response:
+                append = offset > 0 and getattr(response, "status", None) == 206
+                mode = "ab" if append else "wb"
+                if not append and offset:
+                    offset = 0
+                with temp.open(mode) as stream:
+                    shutil.copyfileobj(response, stream, length=1024 * 1024)
+        except Exception as exc:
+            if attempt >= max_attempts:
+                die(f"failed to download {label} after {attempt} attempt(s): {exc}")
+            delay = retry_delay_seconds(attempt, 2, 20)
+            print(
+                json.dumps(
+                    {
+                        "event": "runtime_download_retry",
+                        "label": label,
+                        "attempt": attempt,
+                        "sleep_seconds": delay,
+                        "error": type(exc).__name__,
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
+
+        actual = sha256_file(temp)
+        if actual == expected:
             temp.replace(destination)
             return destination
-        except Exception as exc:
-            last_error = exc
-            temp.unlink(missing_ok=True)
-            if attempt < 3:
-                print(f"[arc-claude-gsc] retrying {label} download ({attempt}/3): {exc}", file=sys.stderr, flush=True)
-                time.sleep(attempt * 2)
-    die(f"failed to download {label}: {last_error}")
+
+        # A complete response with the wrong digest is not safe to resume.
+        temp.unlink(missing_ok=True)
+        if attempt >= max_attempts:
+            die(f"{label} SHA-256 mismatch after {attempt} attempt(s): expected {expected}, got {actual}")
+        delay = retry_delay_seconds(attempt, 2, 20)
+        print(
+            json.dumps(
+                {
+                    "event": "runtime_download_retry",
+                    "label": label,
+                    "attempt": attempt,
+                    "sleep_seconds": delay,
+                    "error": "sha256_mismatch",
+                }
+            ),
+            flush=True,
+        )
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def extract_gsc_payload(payload: Path, zstd_bin: Path, expected: str, cache_root: Path) -> Path:
@@ -197,6 +504,24 @@ def copy_template_contents(output_dir: Path) -> None:
     if not template_dir.is_dir():
         die(f"Factory starter template not found: {template_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    marker = output_dir / ".arc" / "arc-claude-gsc-initialized"
+    existing_runtime_state = (output_dir / ".git").exists() and (output_dir / ".arc" / "traceability").exists()
+    if marker.is_file() or existing_runtime_state:
+        if not marker.is_file():
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("initialized\n", encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "event": "workspace_resume",
+                    "action": "preserve_existing_output",
+                    "marker": str(marker.relative_to(output_dir)),
+                }
+            ),
+            flush=True,
+        )
+        return
+
     for source in sorted(template_dir.iterdir()):
         if source.name == "template.yaml":
             continue
@@ -205,6 +530,8 @@ def copy_template_contents(output_dir: Path) -> None:
             shutil.copytree(source, destination, dirs_exist_ok=True)
         else:
             shutil.copy2(source, destination)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("initialized\n", encoding="utf-8")
 
 
 def copy_arc_skills(output_dir: Path) -> Path | None:
@@ -253,9 +580,16 @@ def ensure_gsc_spec(output_dir: Path, module: RequirementModule) -> Path:
     return path
 
 
-def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir: Path | None, completed: list[str], task_type: str) -> str:
+def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir: Path | None, completed: list[str], task_type: str, *, attempt: int = 1) -> str:
     completed_text = ", ".join(completed) if completed else "none"
     skills_text = f"ARC skills are installed at {skills_dir}." if skills_dir else "The adapter emits baseline ARC runtime states and checkpoints."
+    recovery_text = ""
+    if attempt > 1:
+        recovery_text = (
+            f"RECOVERY ATTEMPT {attempt}: the previous Claude process ended because of a transient upstream/API failure. "
+            "The workspace, GSC state, and all files were intentionally preserved. Inspect the current workspace first, "
+            "continue this same requirement from the existing partial implementation, and do not redo previously passed ROOT modules."
+        )
     return textwrap.dedent(f"""
         You are implementing an ARC-Bench Agentic Software Factory task using original Claude Code with the GSC plugin loaded.
 
@@ -263,6 +597,7 @@ def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir:
         Implement ROOT module {module.index}/{module.total}: {module.node_id} - {module.name}
         Previously completed ROOT modules: {completed_text}
         Requirement source directory: {requirements_dir}
+        {recovery_text}
 
         The current working directory is the persistent generated project. Preserve working features from earlier modules.
         Use GSC actively for requirements/specification, implementation planning, coding, validation, and state tracking rather than bypassing it.
@@ -421,29 +756,160 @@ def main() -> int:
         claude_env["USER"] = username
         claude_env["LOGNAME"] = username
 
+    max_retries = env_int("ARC_MODULE_MAX_RETRIES", 5, minimum=0, maximum=10)
+    retry_base_seconds = env_int("ARC_RETRY_BASE_SECONDS", 5, minimum=1, maximum=300)
+    retry_max_seconds = env_int("ARC_RETRY_MAX_SECONDS", 60, minimum=1, maximum=600)
+    max_budget_usd = os.environ.get("ARC_MAX_BUDGET_USD", "50").strip()
+    base_urls = configured_base_urls(base_url)
+    host = upstream_host(base_urls[0])
+
+    print(
+        json.dumps(
+            {
+                "event": "arc_runtime_policy",
+                "upstream_host": host,
+                "fallback_upstream_hosts": [upstream_host(url) for url in base_urls[1:]],
+                "model": model,
+                "module_max_retries": max_retries,
+                "retry_base_seconds": retry_base_seconds,
+                "retry_max_seconds": retry_max_seconds,
+                "max_budget_usd": max_budget_usd,
+                "resume": "workspace+traceability",
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
     completed: list[str] = []
     try:
         for module in modules:
+            if module_already_passed(runtime, module.node_id):
+                print(
+                    json.dumps(
+                        {
+                            "event": "module_skip",
+                            "req_id": module.node_id,
+                            "reason": "traceability_state_PASSED",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                completed.append(module.node_id)
+                continue
+
             print(f"[arc-claude-gsc] module {module.index}/{module.total}: {module.node_id} - {module.name}", flush=True)
             spec_path = ensure_gsc_spec(output_dir, module)
             runtime.events.mark_design_started(module.node_id, f"Planning {module.name} from {spec_path.relative_to(output_dir)}")
-            command = [
-                str(claude_bin), "-p", module_prompt(module, requirements_dir, skills_dir, completed, args.task_type),
-                "--plugin-dir", str(gsc_dir), "--model", model,
-                "--permission-mode", "bypassPermissions", "--no-session-persistence",
-                "--output-format", "stream-json", "--verbose",
-            ]
             runtime.events.mark_design_done(module.node_id, f"Delegated {module.name} to Claude Code + GSC")
-            runtime.events.mark_implementation_started(module.node_id, f"Implementing {module.name}")
-            claude = subprocess.Popen(command, cwd=output_dir, env=claude_env, preexec_fn=privilege_dropper(identity))
-            _children.append(claude)
-            rc = claude.wait()
-            if rc != 0:
-                runtime.events.mark_implementation_failed(module.node_id, f"Claude Code exited with {rc}")
+
+            def run_attempt(attempt: int) -> ClaudeRunResult:
+                attempt_base_url = base_url_for_attempt(base_urls, attempt)
+                if attempt > 1:
+                    runtime.events.mark_run_resumed(
+                        f"Retry attempt {attempt}/{max_retries + 1} for {module.node_id}; workspace preserved"
+                    )
+                runtime.events.mark_implementation_started(
+                    module.node_id,
+                    f"Implementing {module.name} (attempt {attempt}/{max_retries + 1})",
+                )
+                command = [
+                    str(claude_bin),
+                    "-p",
+                    module_prompt(
+                        module,
+                        requirements_dir,
+                        skills_dir,
+                        completed,
+                        args.task_type,
+                        attempt=attempt,
+                    ),
+                    "--plugin-dir",
+                    str(gsc_dir),
+                    "--model",
+                    model,
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "--no-session-persistence",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                ]
+                if max_budget_usd:
+                    command.extend(["--max-budget-usd", max_budget_usd])
+                attempt_env = claude_env.copy()
+                attempt_env["ANTHROPIC_BASE_URL"] = attempt_base_url
+                return run_claude_streaming(
+                    command,
+                    cwd=output_dir,
+                    env=attempt_env,
+                    preexec_fn=privilege_dropper(identity),
+                )
+
+            def on_retry(
+                attempt: int,
+                result: ClaudeRunResult,
+                classification: FailureClassification,
+                delay: int,
+            ) -> None:
+                current_url = base_url_for_attempt(base_urls, attempt)
+                next_url = base_url_for_attempt(base_urls, attempt + 1)
+                payload = {
+                    "event": "module_retry",
+                    "req_id": module.node_id,
+                    "attempt": attempt,
+                    "next_attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "classification": classification.reason,
+                    "terminal_reason": result.terminal_reason or "unknown",
+                    "returncode": result.returncode,
+                    "api_error_status": result.api_error_status,
+                    "sleep_seconds": delay,
+                    "upstream_host": upstream_host(current_url),
+                    "next_upstream_host": upstream_host(next_url),
+                    "switch_base_url": current_url != next_url,
+                }
+                print(json.dumps(payload, ensure_ascii=False), flush=True)
+                runtime.events.mark_run_paused(
+                    f"Transient upstream/API failure in {module.node_id}; retry {attempt}/{max_retries} after {delay}s"
+                )
+
+            result, attempts = execute_with_retry(
+                run_attempt,
+                max_retries=max_retries,
+                base_seconds=retry_base_seconds,
+                max_seconds=retry_max_seconds,
+                on_retry=on_retry,
+            )
+            classification = classify_claude_failure(result)
+            if result.returncode != 0 or result.is_error:
+                terminal = {
+                    "event": "module_terminal_failure",
+                    "req_id": module.node_id,
+                    "attempts": attempts,
+                    "max_retries": max_retries,
+                    "classification": classification.reason,
+                    "terminal_reason": result.terminal_reason or "unknown",
+                    "returncode": result.returncode,
+                    "api_error_status": result.api_error_status,
+                    "upstream_host": host,
+                }
+                print(json.dumps(terminal, ensure_ascii=False), file=sys.stderr, flush=True)
+                runtime.events.mark_implementation_failed(
+                    module.node_id,
+                    f"Claude Code failed after {attempts} attempt(s): {classification.reason}",
+                )
                 runtime.events.mark_test_failed(module.node_id, "Module did not complete")
-                runtime.events.mark_run_failed(f"Module {module.node_id} failed")
-                return rc
-            runtime.events.mark_implementation_done(module.node_id, f"Implemented {module.name}")
+                runtime.events.mark_run_failed(
+                    f"Module {module.node_id} failed after {attempts} attempt(s): {classification.reason}"
+                )
+                return result.returncode or 1
+
+            runtime.events.mark_implementation_done(
+                module.node_id,
+                f"Implemented {module.name} after {attempts} attempt(s)",
+            )
             runtime.events.mark_test_passed(module.node_id, "Agent completed module validation")
             runtime.git.commit(f"{module.node_id}: {module.name}")
             completed.append(module.node_id)

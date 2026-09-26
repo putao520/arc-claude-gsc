@@ -7,6 +7,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("ARC_MOCK_PORT", "19091"))
+REQUIRE_RECOVERY = os.environ.get("ARC_MOCK_REQUIRE_RECOVERY", "0") == "1"
+RECOVERY_SEEN = False
 
 
 def dump(obj) -> str:
@@ -40,6 +42,20 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         tools = body.get("tools") or []
         messages = body.get("messages") or []
+        global RECOVERY_SEEN
+        serialized_messages = json.dumps(messages, ensure_ascii=False)
+        if REQUIRE_RECOVERY and not RECOVERY_SEEN:
+            if "RECOVERY ATTEMPT" in serialized_messages:
+                RECOVERY_SEEN = True
+                print("[mock] recovery prompt observed; upstream recovers", flush=True)
+            else:
+                print("[mock] injecting upstream connection reset", flush=True)
+                return self.send_json(400, {
+                    "error": {
+                        "message": 'upstream: Post "https://api.taotoken.net/v1/chat/completions": read tcp: connection reset by peer',
+                        "type": "api_error",
+                    }
+                })
         names = [((tool.get("function") or {}).get("name")) for tool in tools]
         print("[mock] tool_count:", len(names), flush=True)
 

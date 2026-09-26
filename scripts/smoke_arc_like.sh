@@ -68,7 +68,11 @@ with zipfile.ZipFile(sys.argv[1]) as zf:
     zf.extractall(sys.argv[2])
 PY
 
-cp "$ROOT/tests/arc_like/mock_openai.py"    "$ROOT/tests/arc_like/verify_arcbench_runtime.py"    "$ROOT/tests/arc_like/arcbench_runtime_sha256.json"    "$WORK/tests/"
+cp "$ROOT/tests/arc_like/mock_openai.py" \
+   "$ROOT/tests/arc_like/verify_arcbench_runtime.py" \
+   "$ROOT/tests/arc_like/arcbench_runtime_sha256.json" \
+   "$ROOT/tests/arc_like/test_self_heal.py" \
+   "$WORK/tests/"
 
 # The production slim agent talks directly to ARC-Bench's Anthropic-compatible
 # endpoint. For local smoke only, anthropic-proxy provides that endpoint in
@@ -118,8 +122,9 @@ cd /workspace/submission
 python3 -m pip install -q -r requirements.txt
 cd /workspace/output
 python3 /workspace/tests/verify_arcbench_runtime.py
+python3 /workspace/tests/test_self_heal.py
 
-python3 /workspace/tests/mock_openai.py >/workspace/artifacts/mock.log 2>&1 &
+ARC_MOCK_REQUIRE_RECOVERY=1 python3 /workspace/tests/mock_openai.py >/workspace/artifacts/mock.log 2>&1 &
 mockpid=$!
 
 env   ANTHROPIC_PROXY_LISTEN_ADDR=127.0.0.1:8787   ANTHROPIC_PROXY_UPSTREAM_URL=http://127.0.0.1:19091/v1/chat/completions   ANTHROPIC_PROXY_UPSTREAM_API_KEY=mock-key   ANTHROPIC_PROXY_DEFAULT_MODEL=mock-model   ANTHROPIC_PROXY_FORCE_MODEL=1   ANTHROPIC_PROXY_TOOL_FORMAT=native   ANTHROPIC_PROXY_CLIENT_KEY=arc-local   /workspace/tests/anthropic-proxy serve >/workspace/artifacts/proxy.log 2>&1 &
@@ -127,7 +132,7 @@ proxypid=$!
 
 sleep 1
 set +e
-env   OPENAI_BASE_URL=http://127.0.0.1:8787   OPENAI_API_KEY=arc-local   MODEL=mock-model   ARCBENCH_SUBMISSION_DIR=/workspace/submission   ARCBENCH_ARTIFACTS_DIR=/workspace/artifacts   python3 /workspace/submission/main.py /workspace/requirements     --output-dir /workspace/output --type web     >/workspace/artifacts/main.out 2>/workspace/artifacts/main.err
+env   OPENAI_BASE_URL=http://127.0.0.1:8787   OPENAI_API_KEY=arc-local   MODEL=mock-model   ARCBENCH_SUBMISSION_DIR=/workspace/submission   ARCBENCH_ARTIFACTS_DIR=/workspace/artifacts   ARC_RETRY_BASE_SECONDS=1   ARC_RETRY_MAX_SECONDS=2   python3 /workspace/submission/main.py /workspace/requirements     --output-dir /workspace/output --type web     >/workspace/artifacts/main.out 2>/workspace/artifacts/main.err
 rc=$?
 kill "$mockpid" "$proxypid" 2>/dev/null || true
 exit "$rc"
@@ -153,6 +158,11 @@ grep -q 'REQ-SMOKE-B' "$WORK/output/.arc/traceability/requirements.json"
 grep -q '"state": "completed"' "$WORK/output/.arc/runner-events.jsonl"
 grep -q 'claude-agent-sdk 0.2.159 bundled Claude Code' "$WORK/artifacts/main.out"
 grep -q 'downloading GSC runtime' "$WORK/artifacts/main.out"
+grep -q '"event": "module_retry"' "$WORK/artifacts/main.out"
+grep -q 'connection reset' "$WORK/artifacts/mock.log"
+grep -q 'recovery prompt observed' "$WORK/artifacts/mock.log"
+grep -q '"state": "paused"' "$WORK/output/.arc/runner-events.jsonl"
+grep -q '"state": "resumed"' "$WORK/output/.arc/runner-events.jsonl"
 
 commit_count="$(git -c safe.directory="$WORK/output" -C "$WORK/output" rev-list --count HEAD)"
 [[ "$commit_count" -ge 3 ]] || {

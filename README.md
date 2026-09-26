@@ -56,6 +56,35 @@ It also maintains:
 git checkpoints
 ```
 
+## Upstream self-healing and module resume
+
+The adapter treats transient model-gateway failures as recoverable at the ROOT-child module boundary. By default it allows five retries after the first Claude Code attempt with exponential backoff:
+
+```text
+5s -> 10s -> 20s -> 40s -> 60s
+```
+
+Retryable examples include upstream connection resets, timeouts, HTTP 429, and HTTP 5xx/529. Authentication failures, invalid API keys, invalid model/configuration errors, context-limit failures, and `budget_exhausted` stop immediately. A `400` response is only retried when its error text contains a transient upstream/network marker.
+
+Every retry preserves the current output worktree and GSC state. The retry prompt tells Claude Code to inspect and continue the partially implemented requirement instead of restarting previous modules. If `main.py` is launched again against the same workspace, a one-time initialization marker prevents the starter template from overwriting existing work, and requirements whose ARC node state is already `PASSED` are skipped.
+
+Runtime controls:
+
+```text
+ARC_MODULE_MAX_RETRIES=5
+ARC_RETRY_BASE_SECONDS=5
+ARC_RETRY_MAX_SECONDS=60
+ARC_MAX_BUDGET_USD=50
+```
+
+The primary model endpoint always comes from ARC's injected `OPENAI_BASE_URL`. Optional fallback endpoints are only used when explicitly configured:
+
+```text
+ARC_FALLBACK_BASE_URLS=https://backup.example/v1,https://backup2.example/v1
+```
+
+There is no implicit fallback to another provider. Logs emit only upstream host names, retry counts, status/classification, backoff duration, and whether the next attempt switches hosts; API keys are never logged.
+
 ## Pinned components
 
 See `runtime.lock.json`.
@@ -128,7 +157,9 @@ The smoke verifies:
 - GSC downloads, verifies, extracts, and its MCP connects;
 - multiple ROOT modules preserve the same worktree;
 - `SPEC/arcbench/*`, runner events, traceability, and git checkpoints are produced;
-- a real Claude Code tool call modifies the requested output directory.
+- a real Claude Code tool call modifies the requested output directory;
+- an injected `400 upstream ... connection reset by peer` terminates the first Claude process, triggers module-level retry, observes a recovery prompt on the second process, and still completes successfully;
+- retry classification unit tests cover reset/429/5xx, non-retryable 400/auth/budget errors, capped backoff, explicit fallback routing, and PASSED-module resume behavior.
 
 The smoke uses `anthropic-proxy` only to emulate ARC's Anthropic-compatible endpoint in front of a deterministic local OpenAI mock. The proxy is test-only and is not packaged.
 
