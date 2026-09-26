@@ -14,6 +14,7 @@ with zipfile.ZipFile(traversal, "w") as zf:
         "skills/arcbench-checkpoint/SKILL.md",
         "skills/arcbench-runtime-signals/SKILL.md",
         "skills/arcbench-traceability/SKILL.md",
+        "arcbench-agent-runtime/pyproject.toml",
     ):
         zf.writestr(name, "x\n")
     zf.writestr("template/../../escape.txt", "bad\n")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import pwd
@@ -18,18 +19,15 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import claude_agent_sdk
 from arcbench_agent_runtime import AgentRuntime
 
 
 SUBMISSION_DIR = Path(os.environ.get("ARCBENCH_SUBMISSION_DIR", Path(__file__).resolve().parent))
 LOCK_PATH = SUBMISSION_DIR / "runtime.lock.json"
 RUNTIME_DIR = SUBMISSION_DIR / "runtime"
-PAYLOAD_DIR = RUNTIME_DIR / "payloads"
-ZSTD_BIN = RUNTIME_DIR / "bin" / "zstd"
-GSC_PAYLOAD = PAYLOAD_DIR / "gsc-runtime.tar.zst"
-CLAUDE_PAYLOAD = PAYLOAD_DIR / "claude.zst"
-GATEWAY_BIN = RUNTIME_DIR / "gateway" / "anthropic-proxy"
 _children: list[subprocess.Popen] = []
+
 
 
 @dataclass(frozen=True)
@@ -82,28 +80,44 @@ def load_lock() -> dict:
         die(f"invalid runtime.lock.json: {exc}")
 
 
-def extract_gsc(lock: dict, cache_root: Path) -> Path:
-    expected = lock["gsc"]["sha256"]
+def download_verified(url: str, destination: Path, expected: str, label: str) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file() and sha256_file(destination) == expected:
+        return destination
+    temp = destination.with_name(destination.name + f".{os.getpid()}.part")
+    temp.unlink(missing_ok=True)
+    print(f"[arc-claude-gsc] downloading {label}: {url}", flush=True)
+    request = urllib.request.Request(url, headers={"User-Agent": "arc-claude-gsc/Factory26"})
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        temp.unlink(missing_ok=True)
+        try:
+            with urllib.request.urlopen(request, timeout=600) as response, temp.open("wb") as stream:
+                shutil.copyfileobj(response, stream, length=1024 * 1024)
+            verify_sha256(temp, expected, label)
+            temp.replace(destination)
+            return destination
+        except Exception as exc:
+            last_error = exc
+            temp.unlink(missing_ok=True)
+            if attempt < 3:
+                print(f"[arc-claude-gsc] retrying {label} download ({attempt}/3): {exc}", file=sys.stderr, flush=True)
+                time.sleep(attempt * 2)
+    die(f"failed to download {label}: {last_error}")
+
+
+def extract_gsc_payload(payload: Path, zstd_bin: Path, expected: str, cache_root: Path) -> Path:
     target = cache_root / "gsc"
     marker = target / ".arc-payload-sha256"
     server = target / "bin" / "gsc-spec-server"
     bootstrap = target / "mcp" / "src" / "bootstrap.mjs"
-
-    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected:
-        if server.is_file() and bootstrap.is_file():
-            return target
-
-    verify_sha256(GSC_PAYLOAD, expected, "GSC runtime payload")
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected and server.is_file() and bootstrap.is_file():
+        return target
 
     temp = cache_root / f".gsc-{os.getpid()}.tmp"
     shutil.rmtree(temp, ignore_errors=True)
     temp.mkdir(parents=True)
-
-    zstd = subprocess.Popen(
-        [str(ZSTD_BIN), "-dc", str(GSC_PAYLOAD)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    zstd = subprocess.Popen([str(zstd_bin), "-dc", str(payload)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert zstd.stdout is not None
     tar = subprocess.run(
         ["tar", "-xf", "-", "-C", str(temp)],
@@ -115,7 +129,6 @@ def extract_gsc(lock: dict, cache_root: Path) -> Path:
     zstd.stdout.close()
     zstd_stderr = (zstd.stderr.read() if zstd.stderr else b"").decode("utf-8", "replace")
     zstd_rc = zstd.wait()
-
     if zstd_rc != 0 or tar.returncode != 0:
         shutil.rmtree(temp, ignore_errors=True)
         die(
@@ -128,7 +141,6 @@ def extract_gsc(lock: dict, cache_root: Path) -> Path:
     if not unpacked.is_dir():
         shutil.rmtree(temp, ignore_errors=True)
         die("GSC runtime archive is missing plugin-final/")
-
     (unpacked / ".arc-payload-sha256").write_text(expected + "\n", encoding="utf-8")
     shutil.rmtree(target, ignore_errors=True)
     unpacked.rename(target)
@@ -136,53 +148,47 @@ def extract_gsc(lock: dict, cache_root: Path) -> Path:
     return target
 
 
-def extract_claude(lock: dict, cache_root: Path) -> Path:
-    expected = lock["claudeCode"]["binarySha256"]
-    target_dir = cache_root / "claude"
-    target = target_dir / "claude"
-    marker = target_dir / ".arc-binary-sha256"
-
-    if target.is_file() and marker.is_file():
-        if marker.read_text(encoding="utf-8").strip() == expected:
-            return target
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    temp = target_dir / f".claude-{os.getpid()}.tmp"
-    temp.unlink(missing_ok=True)
-
-    result = subprocess.run(
-        [str(ZSTD_BIN), "-d", "-f", str(CLAUDE_PAYLOAD), "-o", str(temp)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if result.returncode != 0:
-        temp.unlink(missing_ok=True)
-        die(f"failed to extract Claude Code: {result.stderr[-500:]}")
-
-    verify_sha256(temp, expected, "Claude Code binary")
-    temp.chmod(0o755)
-    temp.replace(target)
-    marker.write_text(expected + "\n", encoding="utf-8")
-    return target
+def bundled_claude_code(lock: dict) -> Path:
+    sdk_version = importlib.metadata.version("claude-agent-sdk")
+    sdk_root = Path(claude_agent_sdk.__file__).resolve().parent
+    binary = sdk_root / "_bundled" / "claude"
+    require_file(binary, f"Claude Code bundled by claude-agent-sdk {sdk_version}")
+    verify_sha256(binary, lock["claudeCode"]["binarySha256"], "Claude Code bundled by claude-agent-sdk")
+    binary.chmod(0o755)
+    print(f"[arc-claude-gsc] using claude-agent-sdk {sdk_version} bundled Claude Code: {binary}", flush=True)
+    return binary
 
 
 def prepare_runtime(lock: dict, artifacts_dir: Path) -> tuple[Path, Path]:
-    require_file(ZSTD_BIN, "zstd")
-    require_file(GSC_PAYLOAD, "GSC runtime payload")
-    require_file(CLAUDE_PAYLOAD, "Claude Code payload")
-    require_file(GATEWAY_BIN, "anthropic-proxy")
-
-    verify_sha256(ZSTD_BIN, lock["zstd"]["sha256"], "zstd")
-    verify_sha256(GATEWAY_BIN, lock["gateway"]["binarySha256"], "anthropic-proxy")
-
-    ZSTD_BIN.chmod(0o755)
-    GATEWAY_BIN.chmod(0o755)
-
     cache_root = artifacts_dir / "runtime"
     cache_root.mkdir(parents=True, exist_ok=True)
-    gsc_dir = extract_gsc(lock, cache_root)
-    claude_bin = extract_claude(lock, cache_root)
+
+    zstd_info = lock["zstd"]
+    zstd_url = (
+        f"https://github.com/putao520/arc-claude-gsc/releases/download/"
+        f"{zstd_info['releaseTag']}/{zstd_info['asset']}"
+    )
+    zstd_bin = download_verified(
+        zstd_url,
+        cache_root / "bin" / "zstd",
+        zstd_info["sha256"],
+        "zstd helper",
+    )
+    zstd_bin.chmod(0o755)
+
+    gsc_info = lock["gsc"]
+    gsc_url = (
+        f"https://github.com/putao520/arc-claude-gsc/releases/download/"
+        f"{gsc_info['releaseTag']}/{gsc_info['asset']}"
+    )
+    payload = download_verified(
+        gsc_url,
+        cache_root / "downloads" / "gsc-runtime.tar.zst",
+        gsc_info["sha256"],
+        "GSC runtime",
+    )
+    gsc_dir = extract_gsc_payload(payload, zstd_bin, gsc_info["sha256"], cache_root)
+    claude_bin = bundled_claude_code(lock)
     return gsc_dir, claude_bin
 
 
@@ -272,29 +278,6 @@ def module_prompt(module: RequirementModule, requirements_dir: Path, skills_dir:
 
         Finish only after implementation and validation are complete. Summarize changed files and validation performed.
     """).strip()
-
-
-def upstream_chat_url(base: str) -> str:
-    clean = base.rstrip("/")
-    if clean.endswith("/chat/completions"):
-        return clean
-    return clean + "/chat/completions"
-
-
-def wait_http(url: str, process: subprocess.Popen, timeout: float = 15.0) -> None:
-    deadline = time.monotonic() + timeout
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            die(f"gateway exited before becoming ready (code={process.returncode})")
-        try:
-            with urllib.request.urlopen(url, timeout=1.0) as response:
-                if response.status < 500:
-                    return
-        except Exception as exc:
-            last_error = exc
-        time.sleep(0.2)
-    die(f"gateway health check timed out: {last_error}")
 
 
 def chown_tree(path: Path, uid: int, gid: int) -> None:
@@ -424,26 +407,13 @@ def main() -> int:
     env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     env["PATH"] = os.pathsep.join([str(gsc_dir / "bin"), str(gsc_dir / "lsp" / "web" / "node_modules" / ".bin"), env.get("PATH", "")])
 
-    gateway_env = env.copy()
-    gateway_env.update({
-        "ANTHROPIC_PROXY_LISTEN_ADDR": "127.0.0.1:8787",
-        "ANTHROPIC_PROXY_UPSTREAM_URL": upstream_chat_url(base_url),
-        "ANTHROPIC_PROXY_UPSTREAM_API_KEY": api_key,
-        "ANTHROPIC_PROXY_DEFAULT_MODEL": model,
-        "ANTHROPIC_PROXY_FORCE_MODEL": "1",
-        "ANTHROPIC_PROXY_TOOL_FORMAT": "native",
-        "ANTHROPIC_PROXY_CLIENT_KEY": "arc-local",
-        "ANTHROPIC_PROXY_LOG_LEVEL": os.environ.get("ARC_GATEWAY_LOG_LEVEL", "info"),
-        "ANTHROPIC_PROXY_REQUEST_TIMEOUT_SEC": "600",
-    })
-    gateway_log = (artifacts_dir / "gateway.log").open("w", encoding="utf-8")
-    gateway = subprocess.Popen([str(GATEWAY_BIN), "serve"], cwd=SUBMISSION_DIR, env=gateway_env, stdout=gateway_log, stderr=subprocess.STDOUT, text=True)
-    _children.append(gateway)
-    wait_http("http://127.0.0.1:8787/health", gateway)
-
+    # ARC-Bench's official Claude starter maps the injected OpenAI-compatible
+    # credentials directly to Claude Code's Anthropic environment. This removes
+    # the protocol bridge from the uploaded agent.
     claude_env = env.copy()
-    claude_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8787"
-    claude_env["ANTHROPIC_API_KEY"] = "arc-local"
+    claude_env["ANTHROPIC_BASE_URL"] = base_url
+    claude_env["ANTHROPIC_AUTH_TOKEN"] = api_key
+    claude_env["ANTHROPIC_API_KEY"] = ""
     for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID"):
         claude_env.pop(key, None)
     if identity is not None:
@@ -459,7 +429,7 @@ def main() -> int:
             runtime.events.mark_design_started(module.node_id, f"Planning {module.name} from {spec_path.relative_to(output_dir)}")
             command = [
                 str(claude_bin), "-p", module_prompt(module, requirements_dir, skills_dir, completed, args.task_type),
-                "--plugin-dir", str(gsc_dir), "--model", "sonnet",
+                "--plugin-dir", str(gsc_dir), "--model", model,
                 "--permission-mode", "bypassPermissions", "--no-session-persistence",
                 "--output-format", "stream-json", "--verbose",
             ]
