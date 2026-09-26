@@ -16,6 +16,9 @@ with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as zf:
     zf.writestr('template/template.yaml', 'type: web\n')
     zf.writestr('template/package.json', '{"name":"arc-smoke","private":true,"type":"module"}\n')
     zf.writestr('template/SPEC/README.md', '# ARC smoke SPEC\n')
+    zf.writestr('skills/arcbench-checkpoint/SKILL.md', '# Checkpoint\n')
+    zf.writestr('skills/arcbench-runtime-signals/SKILL.md', '# Runtime signals\n')
+    zf.writestr('skills/arcbench-traceability/SKILL.md', '# Traceability\n')
 PY
 if [[ "${ARC_SKIP_PACKAGE:-0}" != "1" ]]; then
   ARC_FACTORY26_STARTER_ZIP="$FIXTURE" "$ROOT/scripts/package_submission.sh"
@@ -25,20 +28,24 @@ python3 - "$DIST/submission.zip" "$WORK/submission" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as zf: zf.extractall(sys.argv[2])
 PY
-cp "$ROOT/tests/arc_like/mock_openai.py" "$WORK/tests/"
+cp "$ROOT/tests/arc_like/mock_openai.py" "$ROOT/tests/arc_like/verify_arcbench_runtime.py" "$ROOT/tests/arc_like/arcbench_runtime_sha256.json" "$WORK/tests/"
 cat > "$WORK/requirements/requirements.yaml" <<'YAML'
 id: ROOT
 name: Smoke root
 children:
-  - id: REQ-SMOKE
-    name: Smoke requirement
+  - id: REQ-SMOKE-A
+    name: First smoke requirement
     description: Create ARC_SMOKE.txt in the project root containing exactly ARC_CLAUDE_GSC_OK.
+  - id: REQ-SMOKE-B
+    name: Second smoke requirement
+    description: Preserve ARC_SMOKE.txt and validate that previous module work remains available.
 YAML
 
 set +e
 docker run --rm --cpus=6 --memory=12g -v "$WORK:/workspace" -w /workspace/output "$IMAGE" bash -lc '
 set -e
 python3 -m pip install -q -r /workspace/submission/requirements.txt
+python3 /workspace/tests/verify_arcbench_runtime.py
 python3 /workspace/tests/mock_openai.py >/workspace/artifacts/mock.log 2>&1 & mockpid=$!
 sleep 1
 set +e
@@ -59,6 +66,13 @@ if [[ "$rc" -ne 0 ]] || ! grep -Fxq ARC_CLAUDE_GSC_OK "$WORK/output/ARC_SMOKE.tx
 fi
 test -f "$WORK/output/.arc/runner-events.jsonl"
 test -f "$WORK/output/.arc/traceability/requirements.json"
-git -c safe.directory="$WORK/output" -C "$WORK/output" log --oneline -2
+test -f "$WORK/output/SPEC/arcbench/REQ-SMOKE-A.md"
+test -f "$WORK/output/SPEC/arcbench/REQ-SMOKE-B.md"
+grep -q 'REQ-SMOKE-A' "$WORK/output/.arc/traceability/requirements.json"
+grep -q 'REQ-SMOKE-B' "$WORK/output/.arc/traceability/requirements.json"
+grep -q '"state": "completed"' "$WORK/output/.arc/runner-events.jsonl"
+commit_count="$(git -c safe.directory="$WORK/output" -C "$WORK/output" rev-list --count HEAD)"
+[[ "$commit_count" -ge 3 ]] || { echo "expected at least init + two module commits, got $commit_count" >&2; exit 1; }
+git -c safe.directory="$WORK/output" -C "$WORK/output" log --oneline -5
 echo "Factory26 ARC-like smoke PASS"
 echo "result: $(cat "$WORK/output/ARC_SMOKE.txt")"

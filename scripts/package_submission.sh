@@ -45,15 +45,25 @@ from pathlib import Path
 import sys, zipfile
 src, dst = Path(sys.argv[1]), Path(sys.argv[2])
 with zipfile.ZipFile(src) as zf:
-    names = set(zf.namelist())
-    if "template/template.yaml" not in names:
-        raise SystemExit("official starter ZIP is missing template/template.yaml")
+    names = {name.replace("\\", "/") for name in zf.namelist()}
+    required = {
+        "template/template.yaml",
+        "skills/arcbench-checkpoint/SKILL.md",
+        "skills/arcbench-runtime-signals/SKILL.md",
+        "skills/arcbench-traceability/SKILL.md",
+    }
+    missing = sorted(required - names)
+    if missing:
+        raise SystemExit("official starter ZIP is missing: " + ", ".join(missing))
+    root = dst.resolve()
     for info in zf.infolist():
         if info.is_dir():
             continue
         name = info.filename.replace("\\", "/")
+        target = (dst / name).resolve()
+        if root not in target.parents:
+            raise SystemExit(f"unsafe path in Factory starter ZIP: {info.filename}")
         if name.startswith("template/") or name.startswith("skills/"):
-            target = dst / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(zf.read(info))
 PY

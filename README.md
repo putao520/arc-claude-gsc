@@ -100,9 +100,11 @@ A pass verifies all of these at once:
 - GSC plugin/MCP loads;
 - a real write happens inside `--output-dir`;
 - `.arc/runner-events.jsonl` is produced;
-- ARC traceability files contain the requirement;
-- GSC's `SPEC/` gate is satisfied;
-- git contains an initial checkpoint and a per-module checkpoint.
+- ARC traceability files contain every ROOT child requirement;
+- GSC's `SPEC/` gate is satisfied for every module;
+- multiple ROOT modules preserve the same worktree and create separate checkpoints;
+- the installed `arcbench-runtime==0.1.0` source matches the runtime shipped in the official Claude Code starter file-for-file;
+- git contains an initial checkpoint and per-module checkpoints.
 
 For a repeat run using an already-built `dist/submission.zip`:
 
@@ -123,6 +125,14 @@ ARC injects `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `MODEL`; no model API key i
 ## Runtime Release
 
 The GSC runtime is published under the `gsc-runtime-v1` Release. The submission embeds the compressed pinned asset, so contest runtime does **not** download GSC, Claude Code, Node, LSP, or the gateway from the internet.
+
+Release metadata can be checked against `runtime.lock.json` without downloading the large payloads:
+
+```bash
+python3 scripts/verify_release_assets.py
+```
+
+The packager also rejects incomplete Factory starter archives and ZIP path traversal before fetching any large runtime asset.
 
 ## Security / IP boundary
 
